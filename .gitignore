@@ -1,0 +1,22 @@
+# Arquivos grandes do modelo YOLO
+yolov8n.pt
+*.pt
+
+# Cache Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Ambientes virtuais
+venv/
+env/
+ENV/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Sistema
+.DS_Store
