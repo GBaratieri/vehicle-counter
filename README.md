@@ -1,24 +1,36 @@
 # Vehicle Counter
 
-Sistema de contagem de veículos em tempo real usando YOLO e rastreamento com ByteTrack.
+Sistema de contagem de veículos em tempo real com YOLO + ByteTrack.
 
-## Descrição
+## Tecnologias
 
-Este projeto utiliza:
-- **YOLO (YOLOv8)** para detecção de veículos em tempo real
-- **ByteTrack** para rastreamento de múltiplos objetos
-- **OpenCV** para processamento de vídeo
-- **Threading** para otimização de performance
+| Componente | Função |
+|---|---|
+| YOLOv8n | Detecção de veículos (carros, ônibus, caminhões) |
+| ByteTrack | Rastreamento multi-objeto com IDs persistentes |
+| OpenCV | Captura e renderização de vídeo |
+| Threading | Pipeline de 3 threads independentes |
 
-O sistema conta veículos que passam por uma linha de detecção em um stream de vídeo ao vivo.
+## Arquitetura
+
+```
+Stream HLS
+   │
+   ▼
+CaptureThread  ──► capture_queue ──► ProcessThread ──► display_queue ──► Main Loop (exibição)
+                                           │
+                                      YOLO + ByteTrack
+                                      FlowCounter
+```
 
 ## Arquivos
 
-- `main.py` - Ponto de entrada do programa
-- `vehicle_counter.py` - Lógica principal de contagem e rastreamento
-- `video_processor.py` - Processador de vídeo com ByteTrack
-- `vehicle_tracker.py` - Classe utilitária para rastreamento
-- `yolov8n.pt` - Modelo YOLO (não incluído no repositório, baixe automaticamente)
+| Arquivo | Responsabilidade |
+|---|---|
+| `main.py` | Ponto de entrada; valida a fonte de vídeo e inicia o processador |
+| `video_processor.py` | Pipeline principal: captura → YOLO/ByteTrack → exibição |
+| `vehicle_tracker.py` | Rastreador euclidiano simples (fallback sem ByteTrack) |
+| `vehicle_counter.py` | Processador alternativo usando `VehicleTracker` |
 
 ## Requisitos
 
@@ -29,29 +41,40 @@ pip install opencv-python ultralytics numpy torch torchvision
 ## Uso
 
 ```bash
+# URL padrão (definida em main.py)
 python main.py
+
+# URL personalizada
+python main.py https://meu-stream.com/playlist.m3u8
 ```
 
-## Funcionalidades
+## Configurações principais
 
-- Detecção de veículos (carros, ônibus, caminhões)
-- Rastreamento com IDs únicos
-- Contagem de cruzamentos de linha
-- Suporte para GPU/CPU automático
-- Stream de vídeo ao vivo
-- Interface visual em tempo real
+Em `video_processor.py`:
 
-## Configuração
-
-A fonte de vídeo está configurada em `video_processor.py`:
 ```python
-video_url = "https://camerasdaserra.com.br/stream/BZmZntmZy2GYnJu3oti2/a/playlist.m3u8"
+# ROI: porcentagem da largura central usada
+self._roi_w = int(full_w * 0.60)
+
+# Posição vertical da linha de contagem (% da altura do ROI)
+line_y=int(self._roi_h * 0.72)
+
+# Largura máxima para inferência (velocidade × precisão)
+_INFER_WIDTH = 960
 ```
 
-## Performance
+## Performance esperada
 
-- GPU: 20 FPS
-- CPU: 12 FPS
+| Dispositivo | FPS inferência |
+|---|---|
+| GPU (≥ 2 GB) | ~20 FPS |
+| CPU | ~12 FPS |
+
+## Controles
+
+| Tecla | Ação |
+|---|---|
+| `ESC` ou `Q` | Encerrar |
 
 ## Autor
 

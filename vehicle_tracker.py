@@ -1,142 +1,162 @@
-import cv2
-import numpy as np
-from time import sleep
-import threading
-import queue
-from concurrent.futures import ThreadPoolExecutor
-import multiprocessing
-import psutil
-import time
-from ultralytics import YOLO
+"""
+vehicle_tracker.py
+------------------
+Rastreador simples baseado em distância euclidiana.
+Usado como fallback quando o ByteTrack não está disponível.
+"""
 
-def pega_centro(x, y, largura, altura):
-    """
-    Calcula o centro de um retângulo.
-    """
-    x1 = largura // 2
-    y1 = altura // 2
-    cx = x + x1
-    cy = y + y1
-    return cx, cy
+from __future__ import annotations
+import time
+from dataclasses import dataclass, field
+from typing import Dict, List, Set, Tuple
+
+Detection = Tuple[Tuple[int, int], Tuple[int, int, int, int]]  # (center, bbox)
+
+
+@dataclass
+class TrackedVehicle:
+    center: Tuple[int, int]
+    bbox: Tuple[int, int, int, int]
+    last_y: int
+    current_y: int
+    frames_count: int = 1
+    crossed: bool = False
+    last_update: float = field(default_factory=time.time)
+
 
 class VehicleTracker:
     """
-    Classe para rastrear veículos e detectar quando passam pela linha.
+    Rastreia veículos quadro a quadro usando distância euclidiana
+    e detecta cruzamentos de linha.
     """
-    def __init__(self):
-        self.tracked_vehicles = {}  # ID: {centro, last_y, frames_count, crossed}
-        self.next_id = 0
-        self.max_distance = 80  # Distância máxima para associar veículos
-        self.min_frames = 1     # Mínimo de frames para considerar válido
-        self.last_count_time = 0  # Cooldown para evitar contagem múltipla
-        self.count_cooldown = 0.5  # Tempo de cooldown em segundos
-        self.counted_vehicle_ids = set()  # IDs que já foram contados
 
-    def update_vehicles(self, detections):
-        """
-        Atualiza a lista de veículos rastreados com novas detecções.
-        """
-        current_time = time.time()
-        updated_vehicles = {}
+    MAX_DISTANCE = 80       # px – máxima distância para associar detecções
+    MIN_FRAMES = 1          # frames mínimos antes de contar
+    TTL_NORMAL = 8.0        # segundos para manter veículo que não cruzou
+    TTL_CROSSED = 15.0      # segundos para manter veículo que já cruzou
+    MAX_COUNTED_IDS = 500   # limite de IDs na memória
 
-        for centro, bbox in detections:
-            x, y = centro
-            best_match_id = None
-            best_distance = float('inf')
+    def __init__(self) -> None:
+        self._vehicles: Dict[int, TrackedVehicle] = {}
+        self._counted_ids: Set[int] = set()
+        self._next_id: int = 0
+        self._last_cross_time: float = 0.0
 
-            # Procurar veículo existente mais próximo
-            for vehicle_id, vehicle_data in self.tracked_vehicles.items():
-                old_x, old_y = vehicle_data['centro']
-                distance = ((x - old_x)**2 + (y - old_y)**2)**0.5
+    # ------------------------------------------------------------------
+    # Atualização
+    # ------------------------------------------------------------------
 
-                if distance < self.max_distance and distance < best_distance:
-                    best_distance = distance
-                    best_match_id = vehicle_id
+    def update(self, detections: List[Detection]) -> None:
+        """Associa detecções aos veículos já rastreados (greedy nearest)."""
+        now = time.time()
+        used_ids: Set[int] = set()
+        new_vehicles: Dict[int, TrackedVehicle] = {}
 
-            if best_match_id is not None:
-                # Atualizar veículo existente
-                old_data = self.tracked_vehicles[best_match_id]
-                updated_vehicles[best_match_id] = {
-                    'centro': (x, y),
-                    'last_y': old_data['current_y'],
-                    'current_y': y,
-                    'frames_count': old_data['frames_count'] + 1,
-                    'crossed': old_data.get('crossed', False),
-                    'bbox': bbox,
-                    'last_update': current_time
-                }
+        for center, bbox in detections:
+            cx, cy = center
+            best_id, best_dist = self._nearest(cx, cy, used_ids)
+
+            if best_id is not None:
+                v = self._vehicles[best_id]
+                new_vehicles[best_id] = TrackedVehicle(
+                    center=(cx, cy),
+                    bbox=bbox,
+                    last_y=v.current_y,
+                    current_y=cy,
+                    frames_count=v.frames_count + 1,
+                    crossed=v.crossed,
+                    last_update=now,
+                )
+                used_ids.add(best_id)
             else:
-                # Novo veículo
-                updated_vehicles[self.next_id] = {
-                    'centro': (x, y),
-                    'last_y': y,
-                    'current_y': y,
-                    'frames_count': 1,
-                    'crossed': False,
-                    'bbox': bbox,
-                    'last_update': current_time
-                }
-                self.next_id += 1
+                vid = self._next_id
+                self._next_id += 1
+                new_vehicles[vid] = TrackedVehicle(
+                    center=(cx, cy),
+                    bbox=bbox,
+                    last_y=cy,
+                    current_y=cy,
+                    last_update=now,
+                )
 
-        # Limpar veículos antigos
-        self.tracked_vehicles = {}
-        removed_ids = set()
-        for vid, data in updated_vehicles.items():
-            time_since_update = current_time - data['last_update']
-            max_time = 15.0 if data.get('crossed', False) else 8.0
-            if time_since_update < max_time:
-                self.tracked_vehicles[vid] = data
+        # Mantém veículos não detectados neste frame até expirar o TTL, em
+        # vez de descartá-los de imediato — sem isso, qualquer falha pontual
+        # de detecção já "esquecia" o veículo e o cruzamento podia ser
+        # perdido ou contado em duplicidade com um novo ID.
+        expired: Set[int] = set()
+        for vid, v in self._vehicles.items():
+            if vid in used_ids:
+                continue
+            ttl = self.TTL_CROSSED if v.crossed else self.TTL_NORMAL
+            if now - v.last_update > ttl:
+                expired.add(vid)
             else:
-                removed_ids.add(vid)
+                new_vehicles[vid] = v
 
-        # Limpar IDs contados de veículos removidos
-        ids_to_remove = set()
-        for counted_id in self.counted_vehicle_ids:
-            if counted_id in removed_ids:
-                ids_to_remove.add(counted_id)
+        self._vehicles = new_vehicles
 
-        self.counted_vehicle_ids -= ids_to_remove
-        if ids_to_remove:
-            print(f"🧹 Limpeza: removidos {len(ids_to_remove)} IDs antigos")
+        # Limpa IDs contados de veículos expirados
+        self._counted_ids -= expired
+        if len(self._counted_ids) > self.MAX_COUNTED_IDS:
+            excess = sorted(self._counted_ids)[: len(self._counted_ids) - self.MAX_COUNTED_IDS]
+            self._counted_ids -= set(excess)
 
-    def count_crossings(self, detections, line_y, offset):
-        """
-        Conta quantos veículos passaram pela linha.
-        """
-        self.update_vehicles(detections)
+    def _nearest(
+        self, cx: int, cy: int, used_ids: Set[int]
+    ) -> Tuple[int | None, float]:
+        best_id, best_dist = None, float("inf")
+        for vid, v in self._vehicles.items():
+            if vid in used_ids:
+                continue
+            ox, oy = v.center
+            dist = ((cx - ox) ** 2 + (cy - oy) ** 2) ** 0.5
+            if dist < self.MAX_DISTANCE and dist < best_dist:
+                best_dist = dist
+                best_id = vid
+        return best_id, best_dist
 
-        current_time = time.time()
-        # if current_time - self.last_count_time < self.count_cooldown:
-        #     return 0
+    # ------------------------------------------------------------------
+    # Contagem
+    # ------------------------------------------------------------------
+
+    def count_crossings(self, detections: List[Detection], line_y: int) -> int:
+        """Atualiza rastreamento e retorna número de cruzamentos novos."""
+        self.update(detections)
 
         crossings = 0
+        for vid, v in self._vehicles.items():
+            if v.frames_count < self.MIN_FRAMES:
+                continue
+            if v.crossed or vid in self._counted_ids:
+                continue
 
-        for vehicle_id, vehicle_data in self.tracked_vehicles.items():
-            if (vehicle_data['frames_count'] >= self.min_frames and
-                not vehicle_data['crossed'] and
-                vehicle_id not in self.counted_vehicle_ids):
+            crossed = (v.last_y < line_y <= v.current_y) or (
+                v.last_y > line_y >= v.current_y
+            )
+            if crossed:
+                v.crossed = True
+                self._counted_ids.add(vid)
+                crossings += 1
+                direction = "↓ DESCEU" if v.last_y < line_y else "↑ SUBIU"
+                print(f"[Tracker] Veículo ID:{vid} {direction} | Y: {v.last_y}→{v.current_y}")
 
-                last_y = vehicle_data['last_y']
-                current_y = vehicle_data['current_y']
-
-                crossed_line = ((last_y < line_y and current_y >= line_y) or
-                               (last_y > line_y and current_y <= line_y))
-
-                if crossed_line:
-                    vehicle_data['crossed'] = True
-                    self.counted_vehicle_ids.add(vehicle_id)
-                    crossings += 1
-                    direction = "↓ DESCEU" if (last_y < line_y and current_y >= line_y) else "↑ SUBIU"
-                    print(f"Veículo ID:{vehicle_id} {direction} pela linha!")
-
-        if crossings > 0:
-            self.last_count_time = current_time
+        if crossings:
+            self._last_cross_time = time.time()
 
         return crossings
 
-    def get_tracked_vehicles(self):
-        """
-        Retorna veículos atualmente rastreados.
-        """
-        return [(data['centro'], data['bbox'], vid, data['crossed'])
-                for vid, data in self.tracked_vehicles.items()]
+    # ------------------------------------------------------------------
+    # Consulta
+    # ------------------------------------------------------------------
+
+    def get_tracked_vehicles(
+        self,
+    ) -> List[Tuple[Tuple[int, int], Tuple[int, int, int, int], int, bool]]:
+        return [
+            (v.center, v.bbox, vid, v.crossed)
+            for vid, v in self._vehicles.items()
+        ]
+
+    @property
+    def count(self) -> int:
+        return len(self._counted_ids)
